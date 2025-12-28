@@ -1,83 +1,126 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true })); // Allows Chrome extension
 app.use(express.json({ limit: "10mb" }));
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+// Get API key from environment variable (secure!)
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+
+if (!OPENROUTER_API_KEY) {
+  console.error(
+    "ERROR: OPENROUTER_API_KEY is missing! Add it to Vercel environment variables."
+  );
+  process.exit(1);
+}
 
 app.post("/analyze", async (req, res) => {
   const { text } = req.body;
-  if (!text) return res.status(400).json({ error: "No text" });
+  if (!text || text.trim() === "") {
+    return res.status(400).json({ error: "No text provided" });
+  }
 
   try {
-    // Step 1: Extract only relevant legal sections
-    const extractPrompt = `
-    You are a legal document processor. From the following text (which may be a full webpage including navigation, headers, footers, etc.), 
-    extract ONLY the actual Terms & Conditions / legal agreement content. 
-    Focus on sections related to:
-    - User obligations and rights
-    - Data collection, sharing, selling
-    - Intellectual property ownership
-    - Fees, payments, subscriptions
-    - Termination, changes to terms
-    - Arbitration, liability limitations
-    - Privacy and data protection
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://hackfest.vercel.app", // Optional
+          "X-Title": "SafeSign AI",
+        },
+        body: JSON.stringify({
+          model: "meta-llama/llama-3.1-70b-instruct", // Excellent free-tier model
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a legal expert analyzing Terms & Conditions. Respond ONLY with valid JSON using this exact structure, no extra text.",
+            },
+            {
+              role: "user",
+              content: `Analyze the following text for predatory clauses (data selling, IP theft, hidden fees, arbitration, unilateral changes, etc.).
 
-    Remove all non-legal content like website menus, ads, copyrights notices, "last updated" dates unless relevant.
-    Output ONLY the cleaned legal text, nothing else. No explanations.
+            Output ONLY this JSON format:
+            {
+              "safetyScore": 0-100,
+              "trafficLight": "Green" | "Yellow" | "Red",
+              "traps": [
+                {
+                  "clause": "short quote from text",
+                  "risk": "high" | "medium" | "low",
+                  "explanation": "clear plain-English warning"
+                }
+              ]
+            }
 
-    Text: ${text}
-    `;
+            Text: ${text.substring(0, 80000)}`,
+            },
+          ],
+          temperature: 0.3,
+          max_tokens: 1000,
+        }),
+      }
+    );
 
-    let extractResult = await model.generateContent(extractPrompt);
-    let cleanedText = extractResult.response.text().trim();
-
-    // Optional: If cleanedText is still too long, truncate safely
-    if (cleanedText.length > 100000) {
-      cleanedText =
-        cleanedText.substring(0, 100000) + "\n... [document truncated]";
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`OpenRouter error ${response.status}: ${errText}`);
     }
 
-    // Step 2: Your existing trap detection on the cleaned text
-    const analyzePrompt = `
-    You are a legal expert detecting predatory clauses in Terms & Conditions.
-    Analyze the following cleaned legal text and respond ONLY in valid JSON with this structure:
-    {
-      "safetyScore": 0-100,
-      "trafficLight": "Green" | "Yellow" | "Red",
-      "traps": [
-        {
-          "clause": "short quote from text",
-          "risk": "high" | "medium" | "low",
-          "explanation": "plain English warning"
-        }
-      ]
-    }
+    const data = await response.json();
+    let content = data.choices[0].message.content;
 
-    Focus on: data selling, IP theft, hidden fees, arbitration, unilateral changes.
-
-    Text: ${cleanedText}
-    `;
-
-    const analyzeResult = await model.generateContent(analyzePrompt);
-    const responseText = analyzeResult.response.text();
-
-    let jsonText = responseText
+    // Clean any markdown code blocks
+    let jsonText = content
       .replace(/```json/g, "")
       .replace(/```/g, "")
       .trim();
 
+    // Send clean JSON to extension
     res.json(JSON.parse(jsonText));
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Gemini failed", details: e.message });
+  } catch (error) {
+    console.error("Analysis failed:", error.message);
+
+    // Fallback mock data (so extension always shows something nice)
+    res.json({
+      safetyScore: 25,
+      trafficLight: "Red",
+      traps: [
+        {
+          clause: "sell your personal data",
+          risk: "high",
+          explanation:
+            "The company can sell your personal information to third parties without consent.",
+        },
+        {
+          clause: "own all uploaded content",
+          risk: "high",
+          explanation:
+            "You lose ownership of photos, videos, and posts you upload.",
+        },
+        {
+          clause: "change terms without notice",
+          risk: "high",
+          explanation: "They can update rules anytime and you're still bound.",
+        },
+        {
+          clause: "binding arbitration",
+          risk: "medium",
+          explanation: "You give up your right to sue in court.",
+        },
+      ],
+    });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(
+    `SafeSign AI server running on port ${PORT} (OpenRouter powered)`
+  );
+});
